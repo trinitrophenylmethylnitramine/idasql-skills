@@ -227,32 +227,46 @@ GROUP BY calling_conv ORDER BY count DESC;
 
 ### Return Value Analysis
 
-**"Which functions return 0?"**
+> **Scale notice:** `ctree_v_returns` inherits decompiler behavior — joined against
+> all of `funcs` it decompiles **every function** (fine on small binaries, hours on
+> a 452k-function database). On a big database, seed the join with a bounded
+> function set (working set from anchors, or `funcs ORDER BY size DESC LIMIT N`)
+> and add `LIMIT`. Same rule for every `ctree_v_*` view.
+
+**"Which functions return 0?"** — small databases:
 ```sql
 SELECT DISTINCT f.name FROM funcs f
 JOIN ctree_v_returns r ON r.func_addr = f.addr
-WHERE r.return_num = 0;
+WHERE r.return_num = 0 LIMIT 50;
+```
+
+**"Which functions return 0?"** — big databases (bounded seed):
+```sql
+WITH seed AS (SELECT addr, name FROM funcs ORDER BY size DESC LIMIT 200)
+SELECT DISTINCT s.name FROM seed s
+JOIN ctree_v_returns r ON r.func_addr = s.addr
+WHERE r.return_num = 0 LIMIT 50;
 ```
 
 **"Find functions that return -1 (error pattern)"**
 ```sql
 SELECT DISTINCT f.name FROM funcs f
 JOIN ctree_v_returns r ON r.func_addr = f.addr
-WHERE r.return_num = -1;
+WHERE r.return_num = -1 LIMIT 50;
 ```
 
 **"Functions that return their input argument"**
 ```sql
 SELECT DISTINCT f.name FROM funcs f
 JOIN ctree_v_returns r ON r.func_addr = f.addr
-WHERE r.returns_arg = 1;
+WHERE r.returns_arg = 1 LIMIT 50;
 ```
 
 **"Functions that return the result of another call (wrappers)"**
 ```sql
 SELECT DISTINCT f.name FROM funcs f
 JOIN ctree_v_returns r ON r.func_addr = f.addr
-WHERE r.returns_call_result = 1;
+WHERE r.returns_call_result = 1 LIMIT 50;
 ```
 
 **"Functions with multiple return statements"**
@@ -268,6 +282,13 @@ ORDER BY return_count DESC LIMIT 20;
 ---
 
 ## Common Query Patterns
+
+> **Scale notice:** several patterns below are *whole-program* aggregates —
+> `xrefs`/`disasm_calls`/`blocks`/`ctree_v_*` grouped over all functions. They are
+> the right tool on small binaries and toxic on big ones (full scans; the
+> `ctree_v_*` ones decompile every function). On a big database, apply the same
+> bounded-seed pattern shown in Return Value Analysis, or work from a working set
+> (`bigdb`). Every example here carries a `LIMIT` — keep it that way.
 
 ### Find Most Called Functions
 
@@ -316,7 +337,8 @@ FROM funcs f
 LEFT JOIN disasm_calls c ON c.func_addr = f.addr
 GROUP BY f.addr
 HAVING COUNT(c.addr) = 0
-ORDER BY f.size DESC;
+ORDER BY f.size DESC
+LIMIT 20;
 ```
 
 ### Functions with Deep Call Chains
@@ -333,15 +355,18 @@ LIMIT 10;
 For targeted traversal, prefer the `call_graph` table over `disasm_v_call_chains`:
 
 ```sql
--- Map all functions in a call subtree
+-- Map all functions in a call subtree (bounded; depth ≤3 while exploring in
+-- dense graphs — see bigdb)
 SELECT func_name, depth FROM call_graph
-WHERE start = 0x401000 AND direction = 'down' AND max_depth = 5;
+WHERE start = 0x401000 AND direction = 'down' AND max_depth = 5
+LIMIT 100;
 ```
 
 ### Trace Call Path to Target Function
 
 ```sql
--- Trace call path to an internal helper
+-- Trace call path to an internal helper (max_depth is a search bound; output
+-- is at most the path length)
 SELECT step, func_name FROM shortest_path
 WHERE from_addr = (SELECT addr FROM funcs WHERE name = 'main')
   AND to_addr = (SELECT addr FROM funcs WHERE name = 'copy_user_input')

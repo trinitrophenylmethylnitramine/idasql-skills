@@ -1,0 +1,4 @@
+interface:
+  display_name: "Big Database Mode"
+  short_description: "Efficient RE on very large IDA databases without drowning"
+  default_prompt: "Use $bigdb to analyze this large IDA database efficiently: keep one session, budget every query, and work anchor-first."

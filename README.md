@@ -79,6 +79,7 @@ If you want to test directly from a checkout, keep the repo where it is and use 
 | Skill | Description | When to Use |
 |-------|-------------|-------------|
 | `connect` | Connection, CLI, HTTP, UI context, routing index | Starting a session, CLI options, HTTP server, pragmas |
+| `bigdb` | Working at scale on very large databases | Big/slow databases, query budgets, offload patterns, deep multi-session digs |
 | `ui-context` | Live IDA GUI state capture | What's on screen, current selection/view, active widget |
 | `disassembly` | Functions, segments, instructions, blocks | Querying disassembly, instruction analysis, file generation |
 | `data` | Strings, bytes, string cross-references | String search, byte access, binary pattern search |

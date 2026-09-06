@@ -126,22 +126,95 @@ Use this exact startup flow before deep analysis:
    IDB with `idat`; let `idasql -s raw.exe` do it.
    If a legacy `.idb` upgrades and returns `status:"upgraded"`, restart with the
    JSON `reopen_with` path before running orientation.
+   **On a big database (see Big Database Contract below), the connection mode is
+   always a long-lived server — never per-query CLI.**
 2. Run orientation query:
 ```sql
 SELECT * FROM binary;
 ```
-3. Validate key entities exist:
+3. Read entity counts from `binary` (free) instead of scanning:
 ```sql
-SELECT COUNT(*) AS funcs FROM funcs;
-SELECT COUNT(*) AS xrefs FROM xrefs;
-SELECT COUNT(*) AS strings FROM strings;
+SELECT key, value FROM binary
+WHERE key IN ('funcs_count', 'names_count', 'strings_count', 'segments_count');
 ```
+Only run `SELECT COUNT(*) FROM funcs/strings` on small databases. Never
+`SELECT COUNT(*) FROM xrefs` or `disasm_calls` — on big databases these are
+multi-minute scans or 60 s timeouts.
 4. Introspect schema for target surfaces before authoring complex SQL:
 ```sql
 PRAGMA table_xinfo(funcs);
 PRAGMA table_xinfo(xrefs);
 ```
-5. Route to domain skill using routing matrix below.
+5. Route to domain skill using routing matrix below. **If the database is big,
+   enter `bigdb` mode before any domain skill.**
+
+---
+
+## Big Database Contract
+
+A database is **big** when `funcs_count > 20000`, `names_count > 100000`,
+`strings_count > 500000`, or the `.i64` file exceeds ~200 MB (the counts come free
+from `binary`; the size from the filesystem). On a big database the open cost
+dominates everything (~36 s measured on a 452k-function reference DB), so:
+
+### 1. Server-first, always
+
+- Start **one** long-lived HTTP session per database and reuse it for everything:
+  ```bash
+  idasql -s bigdb.i64 --http 8199 -w &      # ~36 s to open, once
+  curl -s http://127.0.0.1:8199/status       # retry until {"status":"ok",...}
+  ```
+  `-w` persists writes at clean shutdown; otherwise save explicitly with
+  `SELECT save_database()`.
+- **Never answer iterative questions with `idasql -q`** — every invocation repays
+  the full open cost. One-shot scripts on *small* databases are the only `-q` use.
+- Queries run serially on the server (decompiler thread affinity): issue queries
+  sequentially; combine ordered statements into one script.
+
+### 2. Discovery order
+
+Find or choose the server deterministically, don't guess:
+
+1. Known fixed port for this database (team/project convention, or `.pin` autostart
+   from the IDA plugin) → verify with `GET /status`.
+2. Any candidate port → `GET /status` (cheap; confirms liveness and function count).
+3. Nothing alive → start `--http <fixed-port> -w` and proceed.
+
+### 3. Session pragma block (once per server start)
+
+PRAGMAs are per-session state — a restarted server starts clean. Run as **one
+script** so they apply together:
+
+```sql
+PRAGMA idasql.max_queue = 0;                    -- unbounded queue (serial anyway)
+PRAGMA idasql.queue_admission_timeout_ms = 0;   -- wait until served
+PRAGMA idasql.query_timeout_ms = 60000;         -- cap runaway scans
+PRAGMA idasql.hints_enabled = 1;
+PRAGMA idasql.max_rows = 500;                   -- response cap (idasql >= 0.0.19; 0 = unbounded)
+PRAGMA idasql.enable_idapython = 1;             -- only when batching is planned
+PRAGMA idasql.idapython_output_max = 20000;     -- cap Python output before batch loops
+```
+
+The decompiler full-scan guard (`PRAGMA idasql.decomp_scan_max_funcs`, default
+20000, idasql ≥0.0.19) needs no setup: unfiltered `pseudocode`/`ctree*` queries
+error instantly on big databases instead of decompiling every function.
+
+### 4. Liveness and restart
+
+- Before each work turn on a big DB: `GET /status`. If dead: restart, re-run the
+  pragma block, re-verify anchors. Writes since the last `save_database()` are lost —
+  which is why checkpoints (`bigdb` / `re-source`) exist.
+- Shut down explicitly when finished: `POST /shutdown` (with `-w` this also saves).
+  Never kill the process mid-`save_database()`.
+
+### 5. Bootstrap cautions on big databases
+
+- `SELECT rebuild_strings()` is a long blocking rebuild on big images — run it only
+  when `strings_count` is 0 or clearly wrong, never "just in case".
+- `SELECT * FROM binary` is safe. `SELECT COUNT(*) FROM funcs` (~2.7 s at 452k
+  functions) is tolerable once; avoid repeating it.
+- Route into the `bigdb` skill for budgets, working-set discipline, and offload
+  patterns before doing domain work.
 
 ---
 
@@ -166,6 +239,8 @@ These contracts apply across all idasql skills and should be treated as one shar
 ### Performance Contract
 - Always constrain high-cost surfaces (`xrefs`, `instructions`, `ctree*`, `pseudocode`) by key columns.
 - For decompiler surfaces, enforce `func_addr = X` unless explicitly asked for broad scans.
+- Canonical cost classes for every surface live in [references/schema-catalog.md](references/schema-catalog.md): `cheap`, `pushdown` (usable only through its constrained fast path), `expensive` (full scan — budget it), `guarded` (errors when unfiltered). When a skill example predates a big database, add the constraint.
+- On a big database, unfiltered `pseudocode`/`ctree*` decompiles **every function** (hours) and unfiltered `xrefs`/`disasm_calls` scans time out — treat both as forbidden, not merely slow. See the `bigdb` skill.
 - For raw dirtree browsing, prefer `tree = ?` plus `path`, `path LIKE`, or `parent_path`; for normal organization use `funcs.folder_path` and `types.folder_path`.
 - `dirtree_entries` is read-only diagnostics. Recursive folder delete and raw recovery/link operations are intentionally not SQL surfaces.
 
@@ -176,8 +251,9 @@ These contracts apply across all idasql skills and should be treated as one shar
 
 ### Output Contract
 - **Selection** - decide *whether and how much* to surface from user intent. Answer questions directly ("biggest is `main`, 500 bytes"); show supporting rows only when they help the user verify; don't dump full tables unprompted; never surface data fetched only as an intermediate reasoning step.
+- **Budget** - every query states its own bound: explicit column list, `LIMIT` on every row-returning statement over high-cardinality tables (`funcs`, `names`, `strings`, `instructions`, `xrefs`, `types`). Ceiling per response pulled into context: **~500 rows or ~32 KB**; larger legitimate results go to a file (`?format=csv` + client `-o`), then inspect the file selectively. Keep at most ~3 full decompilations in context at once — extract facts, write them down (annotations/ledger), move on. Aggregate first (`COUNT`/`GROUP BY` + `ORDER BY ... LIMIT`), fetch rows second.
 - **Fidelity** - when you *do* present code/data, show the real artifact (decompilation, actual rows), never a paraphrase.
-- **Mechanics** - the HTTP `/query` response is a JSON envelope (`{success, results:[{columns,rows,...}]}`). Consume it directly and render in your reply. Do **not** pipe responses through `python`/`jq` to pre-render a table - that discards the `success`/`elapsed_ms`/`error` fields and makes you reason over a lossy view. The CLI (`-q`/`-f`) already prints a table. Reserve `jq`/`python` for extracting a value to feed a later query. (For direct terminal/pipe use the server can emit `?format=text|csv|tsv`; as an agent, consume `json`.)
+- **Mechanics** - the HTTP `/query` response is a JSON envelope (`{success, results:[{columns,rows,...}]}`). Consume it directly and render in your reply. Do **not** pipe responses through `python`/`jq` to pre-render a table - that discards the `success`/`elapsed_ms`/`error` fields and makes you reason over a lossy view. The CLI (`-q`/`-f`) already prints a table. Reserve `jq`/`python` for extracting a value to feed a later query. (For direct terminal/pipe use the server can emit `?format=text|csv|tsv`; as an agent, consume `json`.) Check `timed_out`/`partial` fields before trusting aggregate numbers — partial rows mean the count is truncated, not final.
 
 ---
 
@@ -188,6 +264,7 @@ Use this deterministic mapping for initial routing:
 | User intent | Primary skill | Typical first query |
 |-------------|---------------|---------------------|
 | "what does this binary do?" / triage | `analysis` | `SELECT * FROM entries;` |
+| big/slow database, floods, deep multi-session dig | `bigdb` | `SELECT key, value FROM binary WHERE key LIKE '%_count';` |
 | disassembly, segments, instructions | `disassembly` | `SELECT * FROM funcs LIMIT 20;` |
 | function/type folders, review buckets, folder lifecycle | `annotations` / `types` | `SELECT addr, name, folder_path FROM funcs WHERE folder_path LIKE 'idasql/%';` |
 | xrefs/callers/callees/import dependencies | `xrefs` | `SELECT * FROM xrefs WHERE to_addr = ...;` |
@@ -206,8 +283,9 @@ Use this deterministic mapping for initial routing:
 
 When prompts span domains, execute in this order:
 1. Orientation in `connect`
-2. Primary domain skill
-3. Adjacent skills for enrichment (for example `xrefs` + `decompiler` + `annotations`)
+2. `bigdb` mode if the database qualifies (Big Database Contract) — budgets apply to every later step
+3. Primary domain skill
+4. Adjacent skills for enrichment (for example `xrefs` + `decompiler` + `annotations`)
 
 ---
 

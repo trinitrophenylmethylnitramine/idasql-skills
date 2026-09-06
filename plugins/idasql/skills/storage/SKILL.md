@@ -43,17 +43,47 @@ DELETE FROM netnode_kv WHERE key = 'author';
 - **Bookkeeping**: Track which functions have been re-sourced, annotated, or reviewed
 - **Configuration**: Store per-database analysis settings
 
-```sql
--- Track analysis progress
-INSERT OR REPLACE INTO netnode_kv(key, value) VALUES('annotated_funcs', '["main","init_config"]');
+**Session-start rule:** the first data query of any resumed investigation reads the
+campaign ledger (below). Progress that isn't read at startup effectively doesn't
+exist.
 
--- Update progress
-UPDATE netnode_kv SET value = '["main","init_config","process_input"]'
-WHERE key = 'annotated_funcs';
+```sql
+-- Track analysis progress with ONE KEY PER ITEM (O(1) reads/writes, no rewrite races).
+-- Do not store one giant JSON list under a single key: it must be rewritten whole
+-- on every update and degrades badly as the campaign grows.
+INSERT OR REPLACE INTO netnode_kv(key, value) VALUES('annotated:main', 'done');
 
 -- Read progress in a new session
-SELECT value FROM netnode_kv WHERE key = 'annotated_funcs';
+SELECT value FROM netnode_kv WHERE key = 'annotated:main';
 ```
+
+---
+
+## Campaign Ledger (standard convention)
+
+Deep investigations (see `re-source`) use two standard key families as their
+working memory. Treat them as the workspace-wide convention — any session (human,
+agent, or script) can resume a campaign by reading them:
+
+| Key | Value | Rules |
+|-----|-------|-------|
+| `campaign:ledger` | JSON: `{goal, state, phase, anchors: ["0x…"], open_questions: [], decisions: [], next: [], updated_at}` | One per campaign; rewrite whole; keep <8 KB |
+| `campaign:func:<hex>` | JSON: `{status: todo\|doing\|done\|blocked\|skipped, summary, confidence, updated_at}` | O(1) per key; enumerate functions from `campaign:ledger`.anchors, never by `LIKE`-scanning keys |
+
+```sql
+-- Resume: first query of a session
+SELECT value FROM netnode_kv WHERE key = 'campaign:ledger';
+
+-- Record a finding
+INSERT OR REPLACE INTO netnode_kv(key, value) VALUES('campaign:func:401000', json_object(
+    'status', 'done',
+    'summary', 'process_context: consumes MY_CONTEXT, frees buffer on refcount 0',
+    'confidence', 'high',
+    'updated_at', datetime('now')));
+```
+
+Legacy `re_source:0x…` keys from older campaigns remain valid — same role as
+`campaign:func:<hex>`.
 
 ---
 
@@ -67,7 +97,7 @@ SELECT value FROM netnode_kv WHERE key = 'annotated_funcs';
 
 **Key rules:**
 - Exact key lookup (`WHERE key = '...'`) is O(1) — this is the preferred access pattern.
-- Prefix scans (`LIKE 'prefix%'`) iterate all entries but are fast for typical netnode sizes.
+- Prefix scans (`LIKE 'prefix%'`) iterate all entries but are fast for typical netnode sizes. At campaign scale (thousands of keys) avoid them — keep the anchor list in `campaign:ledger` and look keys up directly.
 - netnode_kv is stored inside the IDB file — it persists automatically with `save_database()`.
 
 ---
@@ -96,12 +126,13 @@ FROM netnode_kv WHERE key = 'progress:overview';
 
 ### Per-function annotation status tracking
 
-Track which functions have been annotated and what was done:
+Track which functions have been annotated and what was done — one key per function
+(prefer the standard `campaign:func:<hex>` family above):
 
 ```sql
 -- Mark a function as annotated
 INSERT OR REPLACE INTO netnode_kv(key, value)
-VALUES('re_source:' || printf('0x%X', 0x401000),
+VALUES('campaign:func:401000',
        json_object('status', 'done', 'summary', 'DriverEntry init',
                     'analyst', 'alice', 'date', date('now')));
 
@@ -111,7 +142,7 @@ FROM funcs f
 WHERE f.name NOT LIKE 'sub_%'
   AND NOT EXISTS (
     SELECT 1 FROM netnode_kv
-    WHERE key = 're_source:' || printf('0x%X', f.addr)
+    WHERE key = 'campaign:func:' || printf('%X', f.addr)
   )
 ORDER BY f.size DESC
 LIMIT 20;
@@ -122,10 +153,12 @@ LIMIT 20;
 Use a `namespace:entity:id` format for organized storage:
 
 ```
-re_source:0x401000          → per-function annotation status
+campaign:ledger             → the active campaign's goal/state/anchors/next (one key)
+campaign:func:401000        → per-function status (standard re-source convention)
+re_source:0x401000          → per-function status (legacy form, same role)
 config:string_minlen        → analysis configuration
 snapshot:2024-01-15          → point-in-time analysis snapshot
-tag:crypto:0x401000         → function tags/categories
+tag:crypto:401000           → function tags/categories
 ```
 
 ```sql

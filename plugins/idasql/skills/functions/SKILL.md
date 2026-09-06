@@ -11,6 +11,13 @@ allowed-tools:
 
 This skill is a **comprehensive catalog** of every idasql SQL function. Use it to look up any function signature, parameters, and usage.
 
+**Cost notes (see the cost-class matrix in `connect/references/schema-catalog.md`):**
+- `decompile(addr)` — ~50–200 ms first call, ~0 ms cached; `decompile(addr, 1)` always full cost. Length-check before reading huge functions (see `decompiler`).
+- `disasm_func` / `disasm_range` — output size scales with function/range size; prefer windows (`disasm(addr, n)`, `disasm_at(addr, n)`) when probing.
+- `gen_listing(path)` — whole-database listing; very heavy on big databases, generate rarely.
+- `save_database()` — expensive on big databases; batch writes and save at checkpoints.
+- `idapython_snippet` / `idapython_file` — gated by `PRAGMA idasql.enable_idapython = 1`; cap output with `PRAGMA idasql.idapython_output_max` before batch loops.
+
 ---
 
 ## Disassembly

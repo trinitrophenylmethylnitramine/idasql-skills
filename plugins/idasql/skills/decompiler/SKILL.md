@@ -34,6 +34,8 @@ Route to:
 SELECT * FROM pragma_table_list WHERE name IN ('pseudocode', 'ctree', 'ctree_lvars');
 
 -- 2) Pick one concrete function target
+--    (on a big database any unfiltered funcs access — including ORDER BY —
+--    costs a full ~seconds scan; resolve targets once, then use literal EAs)
 SELECT name, printf('0x%X', addr) AS addr, size
 FROM funcs
 ORDER BY size DESC
@@ -46,6 +48,11 @@ SELECT decompile(0x401000);
 Interpretation guidance:
 - `decompile(addr)` is primary display surface.
 - `pseudocode`/`ctree*` are structured query/edit surfaces.
+- On a huge function, length-check before reading:
+  `SELECT length(decompile(ea));` — a 400 KB function returning a few hundred
+  chars means the decompiler bailed or truncated; sample
+  `instructions WHERE func_addr = <EA>` or ctree views instead of analyzing
+  the short text as if it were the function.
 
 ---
 
@@ -57,7 +64,9 @@ Always constrain decompiler tables by function:
 WHERE func_addr = 0x...
 ```
 
-Without this, decompiler tables may decompile every function and become extremely slow.
+**An unfiltered `pseudocode`/`ctree`/`ctree_lvars`/`ctree_call_args` query is forbidden, not merely slow**: it decompiles *every* function in the database — on a 452k-function database that is hours of silent work. Treat it like `DELETE` without a `WHERE` clause. If you need cross-function decompiler data, either seed from a bounded function set (`WHERE func_addr IN (SELECT addr FROM funcs ... LIMIT N)`) or use the offload patterns in `bigdb` (batch decompile to files via IDAPython).
+
+**Aggregation-first:** pattern questions ("which functions return -1", "calls in loops") are answered by the `ctree_v_*` views filtered by `func_addr` — not by reading decompilations. Reserve full `decompile()` output for the few functions a human would actually read.
 
 ---
 
@@ -377,17 +386,19 @@ Preferred SQL write surface for function metadata:
 | `ctree_call_args` | Generator | `func_addr` | Lazy streaming, respects LIMIT |
 
 **Critical rules:**
-- **ALL decompiler tables require `func_addr` constraint.** Without it, every function is decompiled.
+- **ALL decompiler tables require `func_addr` constraint.** Without it, every function is decompiled — forbidden on any multi-thousand-function database (hours at 452k functions).
 - Generator tables (`ctree`, `ctree_call_args`) stream rows lazily and stop at LIMIT.
 - Decompiler views (`ctree_v_calls`, `ctree_v_indirect_calls`, `ctree_v_loops`, etc.) inherit the `func_addr` constraint -- always filter.
 - **Hex-Rays cfunc cache:** `decompile(addr)` is internally cached. `decompile(addr, 1)` forces a full re-decompilation -- only use when you need to see effects of a mutation.
+- **Batch reads:** when decompiling more than a handful of functions, dump to files and return a manifest instead of pulling pseudocode through query responses — see `bigdb` offload patterns.
+- **Huge functions:** length-check first (`SELECT length(decompile(ea))`); decompiler failure on a 100 KB+ function can yield short/truncated text that looks like success.
 
 **Cost model:**
 ```
 decompile(addr)          -> ~50-200ms first call, ~0ms cached
 decompile(addr, 1)       -> ~50-200ms always (forces re-decompile)
 ctree WHERE func_addr=X  -> one decompilation + streaming rows
-ctree (no constraint)    -> one decompilation per row in funcs
+ctree (no constraint)    -> one decompilation per function in the database
 ```
 
 ---
@@ -402,6 +413,7 @@ ctree (no constraint)    -> one decompilation per row in funcs
 
 ## See Also
 
+- `bigdb` — decompiling at scale: budgets, length-sanity for monster functions, batch decompile-to-file
 - `data` — raw bytes and string content referenced by decompiled code (the `bytes` table for per-byte reads and bounded-window reads via `WHERE start_addr = X AND n = N`; `hex(blob_concat(value))` for hex output).
 - `disassembly` — instruction-level ground truth for the same function (`disasm_func`, `instructions`, `disasm_calls`).
 - `xrefs` — callers and callees of a decompiled function; pivot from pseudocode to call graph.

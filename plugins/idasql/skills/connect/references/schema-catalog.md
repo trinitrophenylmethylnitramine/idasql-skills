@@ -7,6 +7,44 @@ Manual refresh procedure:
 2. `PRAGMA table_xinfo(<surface>);`
 3. Update owner mapping here when new surfaces appear.
 
+## Cost Classes (big-database view)
+
+Every surface belongs to one of four cost classes. On small databases the
+distinction is comfort; on big ones (tens of thousands of functions and up — see
+the `bigdb` skill) it is the difference between milliseconds and hours. Times are
+reference measurements on a 452k-function database; they scale roughly with
+function count.
+
+| Class | Meaning | Rule |
+|-------|---------|------|
+| `cheap` | Point-oriented or pre-cached metadata; full reads are fine | No special care |
+| `pushdown` | Fast **only** through its constrained columns | Always filter by the listed columns; never scan unfiltered |
+| `expensive` | Full scan allowed but costly (seconds+) | Budget it: aggregate + `LIMIT`, run rarely, prefer narrow projections |
+| `guarded` | Errors or degrades catastrophically when unfiltered | Filter is mandatory, not advisory |
+
+| Surface | Class | Fast path (pushdown) | Unfiltered cost (reference DB) |
+|---------|-------|----------------------|-------------------------------|
+| `binary`, `db_info`, `ida_info`, `runtime_settings`, `segments`, `entries`, `signatures`, `problems`, `fixups`, `mappings`, `hidden_ranges`, `bookmarks`, `breakpoints`, `comments`, `imports`, `local_type_bookmarks`, `dirtree_folders`, `fchunks` | `cheap` | — | negligible |
+| `strings` | `cheap`+ | `COUNT(*)` optimized; `content LIKE` scans the cached string list | ~0.2 s per LIKE scan (579k strings) |
+| `byte_search` | `cheap` | requires `pattern`; bounds via `start_addr`/`end_addr` | bounded by pattern |
+| `bytes` | `pushdown` | `addr =`, `start_addr = X AND n = N`, tight ranges, `is_patched = 1` | unbounded `addr > X` walks every mapped byte — millions of rows |
+| `heads` | `pushdown` | `addr =`, range + `ORDER BY addr [DESC] LIMIT 1` | full walk of all defined items |
+| `netnode_kv` | `pushdown` | `key =` (O(1)) | `LIKE`/full scan is O(n) over entries |
+| `funcs` | `expensive` | `rowid =`, `addr =` | full scan ~2.7 s — **paid per statement**, incl. `ORDER BY` and subqueries |
+| `names` | `expensive` | `addr =` | full scan ~2.8 s |
+| `grep` | `expensive` | (required `pattern`) | ~7 s per pattern scan |
+| `xrefs` | `pushdown` | `to_addr =`, `from_addr =`, `from_func =` | full scan ~10 s and **24M rows** on the 452k-func reference DB — response flood |
+| `disasm_calls` | `pushdown` | `func_addr =`, `callee_name` filters seeded per function | full scan: >60 s timeout, partial rows |
+| `instructions`, `blocks`, `cfg_edges`, `disasm_loops`, `instruction_operands` | `pushdown` | `func_addr =` (`addr =` for single instructions) | O(all code) scans |
+| `types`, `types_members`, `types_enum_values`, `types_func_args` | `pushdown` | `ordinal =`, `name =`, `name LIKE 'prefix%'` | renders every type — slow on type-heavy IDBs |
+| `type_gaps`, `struct_member_xrefs` | `guarded` | `type_ordinal` / `type_name` / `member_id` | **errors when unfiltered** (by design) |
+| `pseudocode`, `pseudocode_orphan_comments`, `ctree`, `ctree_lvars`, `ctree_call_args`, `ctree_labels` | `guarded` | `func_addr =` | unfiltered would **decompile every function** — idasql ≥0.0.19 refuses it instantly (`PRAGMA idasql.decomp_scan_max_funcs`, default 20000); older builds hang for hours |
+| `ctree_v_*` views | `guarded` | `func_addr =` | inherit decompiler-table behavior |
+| `call_graph`, `shortest_path` | TVF | all HIDDEN params (`start`/`direction`/`max_depth` etc.) | result grows with reachable set — depth ≤3 exploring, `LIMIT` always |
+| `dirtree_entries` | `pushdown` | `tree =` + `path`/`parent_path`/`inode` | full tree walk |
+
+Skill-example rule: any example in any skill that reads a `pushdown`/`guarded`/`expensive` surface carries its constraint or `LIMIT` — when porting an example to a big database, add the constraint the example omits.
+
 ## Tables
 
 | Surface | Kind | Owner Skill | Cols | Writable | Notes |

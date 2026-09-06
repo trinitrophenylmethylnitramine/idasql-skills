@@ -65,7 +65,7 @@ idasql -s database.i64 -i
 **4. HTTP Server Mode**
 ```bash
 idasql -s database.i64 --http 8080
-# Then query via: curl -X POST http://localhost:8080/query -d "SELECT * FROM funcs"
+# Then query via: curl -X POST http://localhost:8080/query -d "SELECT name, size FROM funcs LIMIT 5"
 ```
 
 **5. Export Mode**
@@ -141,6 +141,11 @@ idasql -s database.i64 --export dump.sql --export-tables=funcs,segments
 
 Opening a database has startup overhead (IDALib initialization and auto-analysis wait). For one small query or short script, use `-q`. For iterative work, keep one long-lived session (`-i`, `--http`, or `--mcp`) and run many queries against it.
 
+On a **big database** (>20k functions / >200 MB — measured ~36 s per open at 452k
+functions), `-q` per question is never acceptable: start one `--http` session and
+work through it. See the Big Database Contract in the `connect` skill and the
+session lifecycle in [server-guide.md](server-guide.md).
+
 **One-shot query/script:** Use `-q` directly.
 ```bash
 idasql -s database.i64 -q "SELECT COUNT(*) FROM funcs"
@@ -158,8 +163,8 @@ idasql -s database.i64 --http 8080
 
 # Terminal 2: Query repeatedly via HTTP (instant responses)
 curl -X POST http://localhost:8080/query -d "SELECT * FROM funcs LIMIT 5"
-curl -X POST http://localhost:8080/query -d "SELECT * FROM strings WHERE content LIKE '%error%'"
-curl -X POST http://localhost:8080/query -d "SELECT name, size FROM funcs ORDER BY size DESC"
+curl -X POST http://localhost:8080/query -d "SELECT content, printf('0x%X', addr) FROM strings WHERE content LIKE '%error%' LIMIT 20"
+curl -X POST http://localhost:8080/query -d "SELECT name, size FROM funcs ORDER BY size DESC LIMIT 10"
 # ... as many queries as needed, no startup cost
 ```
 
@@ -180,9 +185,24 @@ PRAGMA idasql.max_queue = 64;                    -- 0 = unbounded
 PRAGMA idasql.hints_enabled = 1;                 -- 1/0, on/off
 PRAGMA idasql.enable_idapython = 1;              -- 1/0, enable SQL Python execution
 PRAGMA idasql.idapython_output_max = 0;          -- cap captured Python print output in bytes (0 = unbounded)
+PRAGMA idasql.max_rows = 500;                    -- cap rows returned per SELECT (0 = unbounded; idasql >= 0.0.19)
+PRAGMA idasql.decomp_scan_max_funcs = 20000;     -- refuse unfiltered pseudocode/ctree* scans above this func count (0 = guard off)
 PRAGMA idasql.timeout_push = 15000;              -- push old timeout, set new (stack bounded to 64)
 PRAGMA idasql.timeout_pop;                       -- restore previous timeout
 ```
+
+Big-database notes (idasql >= 0.0.19):
+
+- **`max_rows`** bounds the *response*, not the scan work — still constrain the query
+  itself. When it truncates, the statement gets `partial:true` and a warning naming
+  the true row count.
+- **`decomp_scan_max_funcs`** turns "accidentally decompile every function" into an
+  immediate error with a fix hint. It applies live (per query) for the cached
+  decompiler tables (`pseudocode`, `ctree_lvars`, `ctree_labels`, orphan-comment
+  tables) and is baked at session start for the generator tables (`ctree`,
+  `ctree_call_args`) — restart the session after changing it for those.
+- The CLI prints a big-database note on `-q`/`-f` when the database has >100k
+  functions, pointing iterative work at `--http`.
 
 The `timeout_push` stack is bounded to **64** entries; the 65th push is rejected
 (guards against unbounded client-driven growth). Pair each push with a `timeout_pop`.
@@ -266,17 +286,18 @@ Bulk byte loading from external files uses:
 
 ## Hex Address Formatting
 
-IDA uses integer addresses. For display, use `printf()`:
+IDA uses integer addresses. For display, use `printf()` (always with a bounded
+selection — an unbounded `FROM funcs` returns every function in the database):
 
 ```sql
 -- 32-bit format
-SELECT printf('0x%08X', addr) as addr FROM funcs;
+SELECT printf('0x%08X', addr) as addr FROM funcs LIMIT 20;
 
 -- 64-bit format
-SELECT printf('0x%016llX', addr) as addr FROM funcs;
+SELECT printf('0x%016llX', addr) as addr FROM funcs LIMIT 20;
 
 -- Auto-width
-SELECT printf('0x%X', addr) as addr FROM funcs;
+SELECT printf('0x%X', addr) as addr FROM funcs LIMIT 20;
 ```
 
 ---

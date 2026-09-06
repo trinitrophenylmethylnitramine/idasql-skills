@@ -15,6 +15,52 @@ idasql -s database.i64 --http 9000 --bind 0.0.0.0
 idasql -s database.i64 --http 8080 --token mysecret
 ```
 
+## Big-Database Session Lifecycle
+
+On a large database the open cost dominates (measured ~36 s on a 452k-function
+reference DB) — the server is not a convenience there, it is the only sane access
+mode. Treat it as a managed session:
+
+```bash
+# 1) Start once (background). -w persists writes at clean shutdown.
+idasql -s bigdb.i64 --http 8199 -w &
+
+# 2) Wait for readiness by polling status (retry until "status":"ok")
+curl -s http://127.0.0.1:8199/status
+#   {"functions":452396,"status":"ok","success":true,"tool":"idasql"}
+
+# 3) Apply the session pragma block (per-session state; one script)
+curl -s -X POST http://127.0.0.1:8199/query --data-binary "
+PRAGMA idasql.max_queue = 0;
+PRAGMA idasql.queue_admission_timeout_ms = 0;
+PRAGMA idasql.query_timeout_ms = 60000;
+PRAGMA idasql.hints_enabled = 1;"
+
+# 4) Check liveness at the start of each work turn; on death: restart at step 1,
+#    re-run step 3, and re-verify anchors (unsaved writes are lost).
+
+# 5) Shut down cleanly when finished (with -w this also saves)
+curl -s -X POST http://127.0.0.1:8199/shutdown
+```
+
+Session rules:
+
+- **One server per database.** Queries execute serially (decompiler thread
+  affinity) — send requests sequentially; chain ordered statements in one script.
+- **Session file (CLI `--http`, idasql >= 0.0.19):** while the server runs it
+  maintains `<database>.idasql-session.json` next to the IDB with
+  `{tool_version, pid, port, bind, db_path, started_at}` — read it to discover the
+  live server deterministically; it is removed on clean shutdown (a stale file
+  means an unclean exit — verify against `/status` before trusting it).
+- **`GET /status` (>= 0.0.19)** reports `db_path`, `funcs_count`/`names_count`/
+  `strings_count`/`segments_count` (instant, from `binary` metadata — not scans),
+  `tool_version`, `uptime_s`, `queries_served`, and `last_query_ms`.
+- **Fixed ports** make discovery deterministic: agree on a per-database port (or use
+  `.pin` autostart from the IDA plugin) instead of random ones.
+- **Never `kill` mid-`save_database()`** — corrupts the IDB. Always `/shutdown`.
+- PRAGMAs, temp state, and unsaved writes reset when the server exits — checkpoint
+  with `SELECT save_database()` and persist notes in `netnode_kv` (see `storage`).
+
 ## HTTP Endpoints
 
 | Endpoint | Method | Auth | Description |
@@ -47,7 +93,7 @@ curl -X POST http://localhost:8080/query -d "SELECT * FROM binary; SELECT COUNT(
 # With authentication
 curl -X POST http://localhost:8080/query \
      -H "Authorization: Bearer mysecret" \
-     -d "SELECT * FROM funcs"
+     -d "SELECT name, size FROM funcs LIMIT 5"
 
 # Check status
 curl http://localhost:8080/status

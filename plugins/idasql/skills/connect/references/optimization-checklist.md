@@ -28,6 +28,17 @@ Use this checklist before merging major skill rewrites.
 - [ ] Raw dirtree examples include `tree = ?` and prefer pushed-down `path`/`parent_path` filters; normal organization examples prefer `funcs.folder_path` / `types.folder_path`.
 - [ ] HTTP/REPL/CLI startup patterns remain deterministic.
 
+## 6) Big-Database Behavior
+- [ ] `connect` carries the Big Database Contract (threshold, server-first, discovery order, session pragma block, liveness/restart).
+- [ ] No skill teaches per-query CLI spawns (`idasql -q`) as an iterative workflow on big databases.
+- [ ] Every example reading a `pushdown`/`guarded`/`expensive` surface (per `connect/references/schema-catalog.md` cost classes) carries its constraint or `LIMIT`.
+- [ ] No example runs unfiltered `pseudocode`/`ctree*` (decompiles every function) or unfiltered `xrefs`/`disasm_calls` aggregates without a small-database caveat.
+- [ ] Graph traversals (`call_graph`, `shortest_path`, recursive CTEs) bound depth and `LIMIT` output; depth guidance is present.
+- [ ] Output budget guidance exists (column lists, `LIMIT`, ~500-row/~32 KB ceiling, big pulls to files).
+- [ ] Deep-dive skills (`re-source`) include the operating loop with resume protocol, campaign ledger keys, checkpoint cadence, and context-pressure protocol.
+- [ ] `storage` documents the standard `campaign:*` ledger keys and the session-start read rule.
+- [ ] Monster-function guidance present where decompilation is taught (length-sanity check before reading).
+
 ## 7) Consistency
 - [ ] Terminology is consistent across skills (`addr`, `func_addr`, `start_addr`, etc.).
 - [ ] Table/view names match live SQL metadata.

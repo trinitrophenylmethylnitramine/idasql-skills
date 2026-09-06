@@ -30,16 +30,22 @@ Route to:
 ## Do This First (Warm-Start Sequence)
 
 ```sql
--- 1) Core relation volume
-SELECT COUNT(*) AS xref_count FROM xrefs;
-
--- 2) Top imports (dependency hints)
+-- 1) Dependency hints (imports is small; safe at any scale)
 SELECT module, COUNT(*) AS import_count
 FROM imports
 GROUP BY module
-ORDER BY import_count DESC;
+ORDER BY import_count DESC
+LIMIT 10;
 
--- 3) Most called functions
+-- 2) Point lookups on a chosen target — the fast path, instant at any scale
+SELECT printf('0x%X', from_addr) AS ref, type, is_code
+FROM xrefs
+WHERE to_addr = <target EA>
+LIMIT 20;
+
+-- 3) Hotspot ranking — full-scan aggregate: SMALL DATABASES ONLY.
+--    On a big database this walks every xref (minutes / timeout); rank a
+--    bounded working set with filtered disasm_calls instead (see bigdb).
 SELECT printf('0x%X', to_addr) AS callee, COUNT(*) AS callers
 FROM xrefs
 WHERE is_code = 1
@@ -49,6 +55,7 @@ LIMIT 20;
 ```
 
 Interpretation guidance:
+- Never start with `SELECT COUNT(*) FROM xrefs` or any unfiltered xrefs query — the table is only fast through `to_addr`/`from_addr`/`from_func` pushdown.
 - Use relation counts to prioritize hotspots before expensive deep analysis.
 - Prefer indexed filters (`to_addr`/`from_addr`) for fast response.
 
@@ -297,17 +304,20 @@ WHERE start = (SELECT addr FROM funcs WHERE name = 'main')
 
 -- All transitive callers
 SELECT func_name, depth FROM call_graph
-WHERE start = 0x405000 AND direction = 'up' AND max_depth = 10;
+WHERE start = 0x405000 AND direction = 'up' AND max_depth = 10
+LIMIT 100;
 
 -- Bidirectional exploration
 SELECT func_name, depth FROM call_graph
-WHERE start = 0x401000 AND direction = 'both' AND max_depth = 3;
+WHERE start = 0x401000 AND direction = 'both' AND max_depth = 3
+LIMIT 100;
 
 -- Join with string_refs to find strings reachable from a function
 SELECT DISTINCT sr.string_value, sr.func_name
 FROM call_graph cg
 JOIN string_refs sr ON sr.func_addr = cg.func_addr
-WHERE cg.start = 0x401000 AND cg.direction = 'down' AND cg.max_depth = 3;
+WHERE cg.start = 0x401000 AND cg.direction = 'down' AND cg.max_depth = 3
+LIMIT 50;
 
 -- Imported APIs reachable from a function's call tree
 SELECT DISTINCT i.module, i.name as api
@@ -315,11 +325,17 @@ FROM call_graph cg
 JOIN disasm_calls dc ON dc.func_addr = cg.func_addr
 JOIN imports i ON dc.callee_addr = i.addr
 WHERE cg.start = 0x401000 AND cg.direction = 'down' AND cg.max_depth = 5
-ORDER BY i.module, i.name;
+ORDER BY i.module, i.name
+LIMIT 50;
 ```
 
 Performance: BFS with visited set. O(reachable functions). Always constrain hidden params.
 Use this pattern when the destination is an import.
+
+**Depth guidance:** result size grows with the reachable set, not with `max_depth`
+alone — in a dense graph (100k+ functions) depth 5+ reaches nearly everything. Keep
+`max_depth` ≤3 while exploring, raise it only to confirm a specific chain, and
+`LIMIT` every traversal.
 
 ---
 
@@ -359,7 +375,7 @@ WHERE sp.from_addr = 0x401000 AND sp.to_addr = 0x405000 AND sp.max_depth = 20
 ORDER BY sp.step;
 ```
 
-Performance: Bidirectional BFS. O(b^(d/2)) where b is branching factor and d is path length. Returns empty result set if no path exists within max_depth.
+Performance: Bidirectional BFS. O(b^(d/2)) where b is branching factor and d is path length. Returns empty result set if no path exists within max_depth. `max_depth` is a search bound, not a result size — output is at most the path length, but the search itself widens with graph density; keep the bound as tight as the question allows.
 
 ---
 

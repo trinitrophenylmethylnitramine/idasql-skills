@@ -14,13 +14,164 @@ For structure recovery patterns, see: `references/struct-recovery-patterns.md`
 
 This skill teaches a **methodology** for recovering source-level understanding from compiled binaries using idasql. It orchestrates the other skills into a systematic workflow.
 
+Deep re-sourcing outlives a single context window. The methodology is therefore
+**resumable by construction**: every valuable fact is written into the IDB
+(annotations + campaign ledger) before the conversation moves on, and every session
+starts by resuming from that state instead of from memory.
+
 ---
 
-## Core Workflow: Recursive Re-Sourcing
+## The Operating Loop
 
-### 1. Start at a Function
+| # | Phase | Purpose | Surfaces | Budget |
+|---|-------|---------|----------|--------|
+| 0 | **RESUME** | Re-enter an existing campaign | `netnode_kv` ledger | ≤3 queries |
+| 1 | **FRAME** | One question + evidence plan | ledger write | 1 write |
+| 2 | **ANCHOR** | Cheap candidate discovery | `grep`, `strings`+`xrefs`, `imports`, filtered `disasm_calls` | ≤20 anchors |
+| 3 | **EXPAND** | Bounded neighborhood | `xrefs` point lookups, `disasm_calls WHERE func_addr=`, `call_graph` (depth ≤3) | ≤20/hop |
+| 4 | **DIG** | Read the shortlist | `decompile(ea)`, ctree | ≤3 in context |
+| 5 | **ANNOTATE** | Make findings durable | `annotations`/`types` writes, `funcs.rpt_comment`, folders | verify each |
+| 6 | **LEDGER** | Record progress + next steps | `netnode_kv` | 1 write/step |
+| 7 | **CHECKPOINT** | Persist everything | `SELECT save_database()` | every ~10 funcs / ~30 min |
 
-Pick a function — an entry point, a function referenced by an interesting string, or a callee of a known function.
+### 0. RESUME — always the first move
+
+```sql
+SELECT value FROM netnode_kv WHERE key = 'campaign:ledger';
+```
+
+If a campaign exists, continue it: re-derive anchor EAs from the ledger's
+`anchors` list (not from memory of earlier turns), check per-function status with
+O(1) key lookups, and proceed to the `next` items. If not, start at FRAME.
+
+### 1. FRAME
+
+State, and record in the ledger: one question, its success criteria, and the
+evidence plan (which surfaces, rough query budget). A session without a framed
+question drifts — that drift is what "getting lost" looks like from the inside.
+
+### 2. ANCHOR — discovery on cheap surfaces only
+
+Pick candidates via `grep` (name patterns), `strings` + xrefs to interesting
+strings, `imports`, or `disasm_calls WHERE callee_name LIKE ...`. On a big database
+follow the `bigdb` skill's contracts — never browse `funcs` as a discovery method.
+Output: a shortlist of ≤20 function EAs, recorded in the ledger.
+
+### 3. EXPAND — bounded neighborhood
+
+One hop at a time, with fan-out caps. In dense graphs (100k+ functions),
+`max_depth` 5+ reaches nearly everything and proves nothing — keep depth ≤3 and
+`LIMIT` every traversal. Details and SQL: see **Expand: callees and callers** below.
+
+### 4. DIG — read the shortlist
+
+`SELECT decompile(ea)` for the few functions that made the cut. Extract facts
+(names, calls, offsets, constants), then write them down (ANNOTATE) before pulling
+the next decompilation. Keep ≤3 full decompilations in context at once. Details:
+see **Dig: read, then annotate** below.
+
+### 5. ANNOTATE — the IDB is long-term memory
+
+Every stabilized fact becomes an annotation: rename, prototype, lvar type,
+pseudocode comment, and a one-line `funcs.rpt_comment` summary (this is what makes
+the function findable by later queries). Move reviewed functions into a campaign
+folder (`UPDATE funcs SET folder_path = 'idasql/<campaign>/reviewed' WHERE addr = ...`).
+Follow the `annotations` skill's Function Summary contract and Mandatory Mutation
+Loop (read → edit → refresh → verify).
+
+### 6. LEDGER — see below
+
+### 7. CHECKPOINT
+
+```sql
+SELECT save_database();
+```
+
+Saves are expensive on big databases — checkpoint at natural boundaries (every
+~10 functions or ~30 minutes, and always before ending a session), not after every
+write.
+
+---
+
+## Campaign Ledger (netnode_kv)
+
+Standard keys (see `storage` for the full netnode_kv reference):
+
+| Key | Value | Rules |
+|-----|-------|-------|
+| `campaign:ledger` | JSON: `{goal, state, phase, anchors: ["0x…"], open_questions: [], decisions: [], next: [], updated_at}` | One per campaign; rewrite whole; keep <8 KB |
+| `campaign:func:<hex>` | JSON: `{status, summary, confidence, updated_at}` with `status ∈ todo\|doing\|done\|blocked\|skipped` | O(1) per key |
+
+```sql
+-- FRAME: create/update the campaign ledger
+INSERT OR REPLACE INTO netnode_kv(key, value) VALUES('campaign:ledger', json_object(
+    'goal', 'Recover the protocol context struct and its lifecycle',
+    'state', 'active', 'phase', 'expand',
+    'anchors', json_array('0x401000','0x401050'),
+    'open_questions', json_array('who frees ctx->buffer?'),
+    'decisions', json_array('MY_CONTEXT is refcounted, not owned'),
+    'next', json_array('decompile 0x401050 callers'),
+    'updated_at', datetime('now')));
+
+-- LEDGER: record a function finding (O(1) key)
+INSERT OR REPLACE INTO netnode_kv(key, value) VALUES('campaign:func:401000', json_object(
+    'status', 'done',
+    'summary', 'process_context: consumes MY_CONTEXT, frees buffer on refcount 0',
+    'confidence', 'high',
+    'updated_at', datetime('now')));
+
+-- RESUME: read per-function status by key (do not LIKE-scan)
+SELECT value FROM netnode_kv WHERE key = 'campaign:func:401000';
+```
+
+Cautions:
+
+- Enumerate functions from `campaign:ledger`.anchors — never `key LIKE 'campaign:%'`
+  scans (O(n) over all netnode entries; fine for dozens, toxic at thousands).
+- Legacy `re_source:0x…` keys from older campaigns remain valid; map them mentally
+  to `campaign:func:<hex>`.
+- The ledger records **progress and decisions**. The durable technical knowledge
+  belongs in annotations (`rpt_comment`, types, names) — the ledger points at it.
+
+---
+
+## Context-Pressure Protocol
+
+When outputs start flooding (a turn blew past its budget, or you can feel the
+session nearing its limits):
+
+1. Stop pulling new data. Finish interpreting what you have.
+2. ANNOTATE what you learned (renames/comments/types).
+3. LEDGER: update `campaign:ledger` (`state`, `phase`, `next`) so the next session
+   resumes exactly here.
+4. Drop the raw text from your reasoning; keep only written-down facts.
+5. Continue with the next FRAME, from a clean slate.
+
+A lost context with a current ledger costs minutes. A lost context without one
+costs the whole investigation.
+
+---
+
+## Definition of Done (per function)
+
+A function is `done` when it has:
+- a meaningful **name**,
+- a best-known **prototype**,
+- a one-line **`rpt_comment` summary**,
+- **types** applied where recoverable (args, locals, struct fields),
+- a **folder** assignment (`idasql/<campaign>/reviewed` or finer).
+
+Until then it stays `doing`. Batch sizing: one annotation pass = ≤10 functions;
+report progress as ledger counts (`done/doing/todo`), not by re-listing functions
+in prose.
+
+---
+
+## Phase Details
+
+### Dig: read, then annotate
+
+Start from an anchor or resumed ledger target:
 
 ```sql
 -- Decompile the target function
@@ -29,8 +180,6 @@ SELECT decompile(0x401000);
 -- Or by name
 SELECT decompile('DriverEntry');
 ```
-
-### 2. Annotate the Function
 
 Use the `annotations` skill to edit the decompilation into something readable:
 
@@ -58,10 +207,8 @@ WHERE func_addr = 0x401000 AND addr = 0x401020;
 SELECT decompile(0x401000, 1);
 ```
 
-### 3. Set a Function Comment
-
-Write a concise summary describing what the function does. This makes the function indexable for later queries.
-For exact trigger semantics (`function summary` / `func-summary` / singular `add function comment`), follow the `annotations` skill's Function Summary contract.
+Set the function summary (makes the function indexable for later queries; exact
+trigger semantics follow the `annotations` skill's Function Summary contract):
 
 ```sql
 SELECT addr, name, comment, rpt_comment
@@ -73,52 +220,53 @@ SET rpt_comment = 'DriverEntry: initializes driver dispatch routines and device 
 WHERE addr = 0x401000;
 ```
 
-### 4. Recurse into Callees
+### Expand: callees and callers (bounded)
 
-Follow calls inside the function. Annotate each callee the same way, building understanding bottom-up.
+Follow calls inside the function, annotate each callee, building understanding
+bottom-up — one hop at a time, fan-out ≤20:
 
 ```sql
--- List callees to visit
+-- List callees to visit (bounded)
 SELECT callee_name, printf('0x%X', callee_addr) as addr
-FROM disasm_calls WHERE func_addr = 0x401000;
+FROM disasm_calls WHERE func_addr = 0x401000
+LIMIT 20;
 
--- Or map the full call subtree at once (BFS with depth tracking)
+-- Or map the call subtree (keep max_depth small; in dense graphs depth 5
+-- reaches nearly everything and proves nothing)
 SELECT func_name, depth FROM call_graph
-WHERE start = 0x401000 AND direction = 'down' AND max_depth = 5;
-
--- Decompile each callee
-SELECT decompile(0x401050);
-
--- Annotate and recurse...
+WHERE start = 0x401000 AND direction = 'down' AND max_depth = 3
+LIMIT 50;
 ```
-
-### 5. Recurse into Callers
 
 Follow callers to build the bigger picture: how is this function used?
 
 ```sql
 -- Who calls this function?
 SELECT caller_name, printf('0x%X', caller_addr) as addr
-FROM callers WHERE func_addr = 0x401000;
+FROM callers WHERE func_addr = 0x401000
+LIMIT 20;
 
--- Or map ALL transitive callers at once
+-- Transitive callers (bounded)
 SELECT func_name, depth FROM call_graph
-WHERE start = 0x401000 AND direction = 'up' AND max_depth = 10;
+WHERE start = 0x401000 AND direction = 'up' AND max_depth = 3
+LIMIT 50;
 
--- Find the shortest path from an entry point to this function
+-- Shortest path from an entry point (max_depth is a search bound, not a
+-- result size — always LIMIT the output)
 SELECT step, func_name FROM shortest_path
 WHERE from_addr = (SELECT addr FROM funcs WHERE name = 'main')
-  AND to_addr = 0x401000 AND max_depth = 20;
-
--- Decompile callers to see usage context
-SELECT decompile(0x400F00);
+  AND to_addr = 0x401000 AND max_depth = 10;
 ```
 
-### 6. Structure Recovery
+On big databases, prefer the recursion through point lookups over graph TVFs when
+you need context at each step (the CTE pattern under Advanced Patterns), and
+consult `bigdb` for budgets.
+
+### Structure Recovery
 
 The hardest part. Decompiled code often shows casts like `*(DWORD *)(a1 + 0x10)` — these are structure field accesses.
 
-#### Step-by-step Process
+#### Step-by-Step Process
 
 **a) Identify offset patterns in a single function:**
 ```sql
@@ -188,18 +336,9 @@ WHERE func_addr = 0x401000 AND idx = 0;
 SELECT decompile(0x401000, 1);
 ```
 
-### 7. Track Progress
-
-Use `netnode_kv` to persist progress across sessions:
-
-```sql
--- Mark a function as fully annotated
-INSERT INTO netnode_kv(key, value)
-VALUES('re_source:0x401000', '{"status":"done","summary":"DriverEntry init"}');
-
--- Check progress
-SELECT key, value FROM netnode_kv WHERE key LIKE 're_source:%';
-```
+Recovering a struct across many functions on a big database? Pull the caller set to
+a file or one IDAPython batch pass (`bigdb` offload patterns) instead of
+decompiling them one query at a time.
 
 ---
 
@@ -209,7 +348,7 @@ SELECT key, value FROM netnode_kv WHERE key LIKE 're_source:%';
 
 Find all functions that transitively pass a struct through a chain of calls — who ultimately provides the data?
 
-> **Prefer `call_graph` for simple traversal:** `SELECT func_name, depth FROM call_graph WHERE start = 0x401000 AND direction = 'up' AND max_depth = 5` replaces the CTE below. Use the CTE only when you need to JOIN caller context (e.g. offset accesses) at each step.
+> **Prefer `call_graph` for simple traversal:** `SELECT func_name, depth FROM call_graph WHERE start = 0x401000 AND direction = 'up' AND max_depth = 3 LIMIT 50` replaces the CTE below. Use the CTE only when you need to JOIN caller context (e.g. offset accesses) at each step.
 
 ```sql
 -- Recursive CTE: walk callers up to 5 levels
@@ -274,6 +413,8 @@ Functions with the most `cot_add` offset patterns are likely manipulating struct
 
 ```sql
 -- Functions with most pointer arithmetic (struct field access candidates)
+-- Note: the ctree IN-list decompiles each seed function once; keep the seed
+-- set small (this is a per-function cost, not a table scan).
 WITH offset_funcs AS (
     SELECT func_addr,
            COUNT(*) AS offset_accesses,
@@ -332,15 +473,20 @@ ORDER BY o.offset;
 
 4. **Verify every edit**: Follow the Mandatory Mutation Loop (read → edit → refresh → verify) from the `annotations` skill.
 
-5. **Save periodically**: Use `SELECT save_database()` to persist your work.
+5. **Write before you drop**: annotations + ledger before dropping raw output from context — the IDB and the ledger are the campaign's memory, the conversation is scratch.
+
+6. **Checkpoint on a cadence**: `SELECT save_database()` every ~10 functions or ~30 minutes, and always before ending a session.
+
+7. **Bounded expansion**: fan-out ≤20 per hop, graph depth ≤3; aggregate before listing.
 
 ---
 
 ## Related Skills
 
+- **`bigdb`** — working at scale: session discipline, query budgets, offload patterns (batch decompile to files, subagent fan-out)
 - **`annotations`** — The editing/annotation workflow: how to rename, retype, comment
 - **`decompiler`** — Deep decompiler reference: ctree, types, parse_decls, union selection
 - **`types`** — Type system mechanics: struct/union/enum creation and manipulation
 - **`xrefs`** — Caller/callee traversal, `call_graph` / `shortest_path` tables, `string_refs` view
 - **`disassembly`** — `cfg_edges` for control flow understanding during struct recovery
-- **`storage`** — netnode_kv for tracking progress across sessions
+- **`storage`** — netnode_kv reference and the campaign ledger key conventions

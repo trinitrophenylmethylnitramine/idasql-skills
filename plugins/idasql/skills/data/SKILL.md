@@ -51,6 +51,9 @@ Interpretation guidance:
 
 - No strings or unexpectedly low count:
   - Run `rebuild_strings()` and validate with `COUNT(*) FROM strings`.
+  - Caution: `rebuild_strings()` is a long blocking rebuild on big images (hundreds
+    of thousands of strings) — run it only when the count is 0 or clearly wrong,
+    never "just in case" (see `bigdb`).
 - Too many false positives:
   - Increase specificity (`LIKE`, regex-like pattern narrowing, module/function join filters).
 - Byte pattern search too broad:
