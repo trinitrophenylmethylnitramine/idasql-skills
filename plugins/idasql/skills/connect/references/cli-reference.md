@@ -76,6 +76,20 @@ idasql -s database.i64 --export dump.sql
 idasql -s database.i64 --export dump.sql --export-tables=funcs,segments
 ```
 
+**5b. Binary SQLite Export (>= 0.0.20)** — a queryable offline snapshot rather
+than SQL-text INSERTs. Default set: `funcs, segments, names, imports, entries,
+strings, disasm_calls, xrefs` (decompiler tables deliberately excluded — bulk
+decompilation is what the guard prevents):
+
+```bash
+idasql -s database.i64 --export-sqlite offline.db
+idasql -s database.i64 --export-sqlite offline.db --export-tables=funcs,names,strings
+```
+
+Then explore with plain `sqlite3` (no IDA, no open cost, repeatable): indexes can
+be added offline for hot columns. Reference cost on the 452k-function DB: ~3m50s
+one-time for the full default set (24.2M xrefs, 5.8M calls).
+
 ### CLI Options
 
 | Option | Description |
@@ -187,6 +201,7 @@ PRAGMA idasql.enable_idapython = 1;              -- 1/0, enable SQL Python execu
 PRAGMA idasql.idapython_output_max = 0;          -- cap captured Python print output in bytes (0 = unbounded)
 PRAGMA idasql.max_rows = 500;                    -- cap rows returned per SELECT (0 = unbounded; idasql >= 0.0.19)
 PRAGMA idasql.decomp_scan_max_funcs = 20000;     -- refuse unfiltered pseudocode/ctree* scans above this func count (0 = guard off)
+PRAGMA idasql.xrefs_shared_cache = 0;            -- opt-in: materialize xrefs once per session (0/1; idasql >= 0.0.20)
 PRAGMA idasql.timeout_push = 15000;              -- push old timeout, set new (stack bounded to 64)
 PRAGMA idasql.timeout_pop;                       -- restore previous timeout
 ```
@@ -199,8 +214,15 @@ Big-database notes (idasql >= 0.0.19):
 - **`decomp_scan_max_funcs`** turns "accidentally decompile every function" into an
   immediate error with a fix hint. It applies live (per query) for the cached
   decompiler tables (`pseudocode`, `ctree_lvars`, `ctree_labels`, orphan-comment
-  tables) and is baked at session start for the generator tables (`ctree`,
-  `ctree_call_args`) — restart the session after changing it for those.
+  tables) and for the generator tables (`ctree`, `ctree_call_args`) since 0.0.20.
+- **`xrefs_shared_cache`** (0.0.20, default off) materializes the xrefs table into a
+  session cache: one full-universe walk (~10 s at 24M xrefs) plus RAM proportional
+  to the xref count (~1.5 GB on the reference DB), after which `to_addr IN (...)`
+  queries and unfiltered aggregates run in-memory. Point lookups keep their O(1)
+  pushdown either way. Off = per-statement builder (no extra RAM).
+- Since 0.0.20 the `funcs`/`names` tables use a session cache automatically: first
+  read of a session builds (~3 s at 452k/650k rows), warm reads are milliseconds,
+  and any write statement drops the cache (next read rebuilds).
 - The CLI prints a big-database note on `-q`/`-f` when the database has >100k
   functions, pointing iterative work at `--http`.
 

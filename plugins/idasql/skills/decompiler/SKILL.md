@@ -390,7 +390,7 @@ Preferred SQL write surface for function metadata:
 - Generator tables (`ctree`, `ctree_call_args`) stream rows lazily and stop at LIMIT.
 - Decompiler views (`ctree_v_calls`, `ctree_v_indirect_calls`, `ctree_v_loops`, etc.) inherit the `func_addr` constraint -- always filter.
 - **Hex-Rays cfunc cache:** `decompile(addr)` is internally cached. `decompile(addr, 1)` forces a full re-decompilation -- only use when you need to see effects of a mutation.
-- **Batch reads:** when decompiling more than a handful of functions, dump to files and return a manifest instead of pulling pseudocode through query responses — see `bigdb` offload patterns.
+- **Batch reads:** when decompiling more than a handful of functions, use `SELECT dump_pseudocode(path, addr_or_folder)` (idasql ≥0.0.20) — server-side decompile straight to files with a manifest, nothing through the response. Folder form: curate targets with `UPDATE funcs SET folder_path=...` then dump the folder; honors the guard and the query timeout. See `bigdb` offload patterns for the worked recipe.
 - **Huge functions:** length-check first (`SELECT length(decompile(ea))`); decompiler failure on a 100 KB+ function can yield short/truncated text that looks like success.
 
 **Cost model:**

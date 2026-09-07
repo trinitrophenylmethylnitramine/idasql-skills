@@ -13,6 +13,7 @@ This skill is a **comprehensive catalog** of every idasql SQL function. Use it t
 
 **Cost notes (see the cost-class matrix in `connect/references/schema-catalog.md`):**
 - `decompile(addr)` — ~50–200 ms first call, ~0 ms cached; `decompile(addr, 1)` always full cost. Length-check before reading huge functions (see `decompiler`).
+- `dump_pseudocode(path, addr_or_folder)` — batch decompile **to files** (idasql ≥0.0.20): integer EA dumps one function to exactly `path`; a funcs-folder string dumps the folder (one `<EA>.c` per function + `manifest.json`) and returns only a summary. The context-friendly replacement for pulling N decompilations through responses; honors the `decomp_scan_max_funcs` guard and the query timeout.
 - `disasm_func` / `disasm_range` — output size scales with function/range size; prefer windows (`disasm(addr, n)`, `disasm_at(addr, n)`) when probing.
 - `gen_listing(path)` — whole-database listing; very heavy on big databases, generate rarely.
 - `save_database()` — expensive on big databases; batch writes and save at checkpoints.

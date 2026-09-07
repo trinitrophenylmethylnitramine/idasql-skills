@@ -59,10 +59,57 @@ generate rarely), `gen_cfg_dot_file(addr, path)` (per-function CFG).
 
 ---
 
-## 3. IDAPython Batch Decompile (One Round Trip, Zero Context Flood)
+## 3. Batch Decompile via dump_pseudocode (preferred, idasql >= 0.0.20)
 
-For "decompile these 30 functions and tell me which ones touch X": do it inside the
-IDA process, write files, return only a manifest. Enable once per session:
+`dump_pseudocode(path, target)` decompiles server-side and writes files — pseudocode
+never passes through the response. `target` is either an integer EA (dump that one
+function to exactly `path`) or a funcs-folder path (one `<EA>.c` per function in the
+folder + `manifest.json`; returns a summary).
+
+```sql
+-- Single function to an exact file
+SELECT dump_pseudocode('E:/rev/dump/entry.c', 0xB7FDDC);
+-- -> {"addr":"0xB7FDDC","name":"nullsub_7479","ok":true,"bytes":81,"path":"..."}
+
+-- Batch: curate a folder, then dump it
+INSERT INTO dirtree_folders(tree, path) VALUES('funcs', 'idasql/dump');
+UPDATE funcs SET folder_path = 'idasql/dump'
+WHERE addr IN (0x123456, 0x1234A0 /*, ... */);
+SELECT dump_pseudocode('E:/rev/dump/batch', 'idasql/dump');
+-- -> {"ok":true,"dumped":2,"failed":0,"manifest":"E:/rev/dump/batch/manifest.json",...}
+```
+
+Then inspect the dumped files selectively (Grep for the pattern, Read the hits) —
+never the whole set. Folder dumps honor `PRAGMA idasql.decomp_scan_max_funcs` and
+the query-interrupt flag, so a runaway dump is refused/cut short.
+
+## 4. Offline Export (--export-sqlite, idasql >= 0.0.20)
+
+Materialize the structural surfaces once, then explore with plain sqlite3 — no IDA
+involved, no open cost, unlimited re-querying. Measured on the 452k-function
+reference DB (one-time cost):
+
+```bash
+idasql -s bigdb.i64 --export-sqlite offline.db
+#   funcs: 36 s | names: 9 s | strings: 0.5 s | disasm_calls: 103 s | xrefs: 48 s
+#   total ~3m50s -> 452k funcs, 650k names, 579k strings, 5.8M calls, 24.2M xrefs
+```
+
+```bash
+sqlite3 offline.db "SELECT f.name, COUNT(*) c FROM xrefs x JOIN funcs f ON f.addr=x.to_addr GROUP BY x.to_addr ORDER BY c DESC LIMIT 10;"
+```
+
+Reference timings offline: whole-program 24M-row hotspot aggregate ~6.4 s (repeatable,
+no IDA); add indexes once (`CREATE INDEX ix ON xrefs(to_addr)`, ~11 s) and targeted
+queries drop to milliseconds. Workflow: **materialize → explore offline → return to
+live IDA only for decompile + annotate.** The exported file is a snapshot — re-export
+after big annotation campaigns if you need names/folders fresh.
+
+## 5. IDAPython Custom Passes (when SQL can't express it)
+
+`dump_pseudocode` covers plain batch decompilation. Use IDAPython only for custom
+per-function analysis (correlation, clustering, custom visitors). Enable once per
+session:
 
 ```sql
 PRAGMA idasql.enable_idapython = 1;
@@ -106,7 +153,7 @@ Rules of the road:
 
 ---
 
-## 4. Subagent Fan-Out
+## 6. Subagent Fan-Out
 
 When your harness supports parallel subagents, use them as **bounded question
 executors**, not explorers. The parent owns the session, the ledger, and all writes.
@@ -129,7 +176,7 @@ This keeps each context small and the IDB writes serialized and reviewable.
 
 ---
 
-## 5. Working-Set Walk-Through (il2cpp-style target)
+## 7. Working-Set Walk-Through (il2cpp-style target)
 
 Goal: "find the save-game encryption."
 

@@ -32,12 +32,15 @@ On a reference database (libil2cpp, 452,396 functions, 650,307 names, 578,920 st
 | Operation | Small DB | 452k-func reference DB |
 |---|---|---|
 | `idasql -s db.i64 -q "..."` (one process per query) | ~1 s | **~36 s** — database open dominates |
-| Unfiltered `funcs` scan / `ORDER BY` / funcs subquery | instant | **~2.7 s per statement**, repeated every statement |
-| `grep WHERE pattern = '...'` | instant | ~7 s |
+| First `funcs`/`names` read of a session | instant | ~2.8 s once (session cache build) |
+| Warm `funcs`/`names` scan, `ORDER BY`, subquery | instant | **~5–30 ms** (idasql ≥0.0.20 session cache; was ~2.7 s per statement) |
+| After a write statement | — | next funcs/names read rebuilds (~3 s) — batch writes, read after |
+| `grep WHERE pattern = '...'` | instant | ~7 s (iterator scan each time — budget it) |
 | `strings WHERE content LIKE '%x%'` | instant | ~0.2 s (cheap — string list is cached in the IDB) |
 | `xrefs WHERE to_addr = <EA>` | instant | instant (pushdown works) |
+| `xrefs WHERE to_addr IN (literals)` | full scan | **~0 ms** (SQLite loops the O(1) pushdown per value) |
+| `xrefs` non-pushdown aggregate (`is_code=1`, joins) | fast | ~10 s per query → **~0.5 s** after `PRAGMA idasql.xrefs_shared_cache = 1` (opt-in; one ~10 s materialization + RAM ~1.5 GB at 24M xrefs) |
 | `decompile(ea)` | 50–200 ms | ~0 ms warm, 50–200 ms cold |
-| `SELECT COUNT(*) FROM xrefs` (full scan) | fast | ~10 s, **24.2M rows** — response flood |
 | `SELECT COUNT(*) FROM disasm_calls` (full scan) | fast | **>60 s → times out, partial rows** |
 | Unfiltered `pseudocode` / `ctree*` | slow | **idasql ≥0.0.19: refused instantly by the `decomp_scan_max_funcs` guard; older: decompiles all 452k functions — hours** |
 
@@ -80,7 +83,7 @@ Never explore a big database by browsing. Navigate anchor → neighborhood → s
 3. **SHORTLIST** — rank the expanded set (by size, call count, string hits) and pick the few functions that actually need reading.
 4. **DIG** — `SELECT decompile(ea)` for the shortlist only, under Contract 2's three-decompilation rule.
 
-The hidden trap at step 1–2: **any unfiltered `funcs` access costs a full scan** (~2.7 s at 452k functions) *per statement* — including `ORDER BY`, and including innocent-looking subqueries like `(SELECT addr FROM funcs WHERE name = 'x')`. Mitigate by resolving anchors once into literal EAs and reusing them, or seeding CTEs from a `funcs ... LIMIT`-bounded selection.
+The funcs tax is history on idasql ≥0.0.20: the first unfiltered `funcs`/`names` read of a session builds a session cache (~3 s once at 452k functions); warm scans, `ORDER BY`s, and subqueries then run in milliseconds. Two residual rules: **a write statement drops the cache** (the next read rebuilds — batch your writes instead of interleaving), and wide column reads (`name`, `prototype` for every row) still pay per-row IDA lookups on first touch, so keep projections narrow when you can.
 
 ## Contract 4 — Aggregation-First Analysis
 
@@ -107,7 +110,7 @@ A 397,744-byte function returning 753 chars of pseudocode means the decompiler b
 - Anchor on: exported il2cpp entry points, `global-metadata` strings, string references in `strings` (cheap), vtable/type structures, and the minority of genuinely named functions.
 - Give up breadth early: define the question, find its 20 anchors, be done.
 
-For worked offload recipes (result-to-file, IDAPython batch decompilation with a persistent sandbox, subagent fan-out, the measurement battery): [references/bigdb-patterns.md](references/bigdb-patterns.md).
+For worked offload recipes (batch decompile via `dump_pseudocode`, offline export via `--export-sqlite`, result-to-file, IDAPython batching with a persistent sandbox, subagent fan-out, the measurement battery): [references/bigdb-patterns.md](references/bigdb-patterns.md).
 
 ---
 

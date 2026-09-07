@@ -30,10 +30,10 @@ function count.
 | `bytes` | `pushdown` | `addr =`, `start_addr = X AND n = N`, tight ranges, `is_patched = 1` | unbounded `addr > X` walks every mapped byte — millions of rows |
 | `heads` | `pushdown` | `addr =`, range + `ORDER BY addr [DESC] LIMIT 1` | full walk of all defined items |
 | `netnode_kv` | `pushdown` | `key =` (O(1)) | `LIKE`/full scan is O(n) over entries |
-| `funcs` | `expensive` | `rowid =`, `addr =` | full scan ~2.7 s — **paid per statement**, incl. `ORDER BY` and subqueries |
-| `names` | `expensive` | `addr =` | full scan ~2.8 s |
-| `grep` | `expensive` | (required `pattern`) | ~7 s per pattern scan |
-| `xrefs` | `pushdown` | `to_addr =`, `from_addr =`, `from_func =` | full scan ~10 s and **24M rows** on the 452k-func reference DB — response flood |
+| `funcs` | `expensive`→`cheap` (warm) | `rowid =`, `addr =` | first read of a session ~2.8 s (session-cache build, idasql ≥0.0.20); warm scans/`ORDER BY`/subqueries ~5–30 ms; writes drop the cache (next read rebuilds) |
+| `names` | `expensive`→`cheap` (warm) | `addr =` | same session-cache lifecycle as `funcs` (~3 s build at 650k names) |
+| `grep` | `expensive` | (required `pattern`) | ~7 s per pattern scan (iterator, not cached — budget it) |
+| `xrefs` | `pushdown` | `to_addr =`, `from_addr =`, `from_func =` | full scan ~10 s and **24M rows** on the 452k-func reference DB — response flood; `PRAGMA idasql.xrefs_shared_cache = 1` (≥0.0.20) materializes once per session so `IN (...)` and aggregates run in-memory |
 | `disasm_calls` | `pushdown` | `func_addr =`, `callee_name` filters seeded per function | full scan: >60 s timeout, partial rows |
 | `instructions`, `blocks`, `cfg_edges`, `disasm_loops`, `instruction_operands` | `pushdown` | `func_addr =` (`addr =` for single instructions) | O(all code) scans |
 | `types`, `types_members`, `types_enum_values`, `types_func_args` | `pushdown` | `ordinal =`, `name =`, `name LIKE 'prefix%'` | renders every type — slow on type-heavy IDBs |

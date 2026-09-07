@@ -79,6 +79,47 @@ Each sandbox key creates an isolated Python namespace:
 - The same sandbox key reuses its namespace across calls (state persists within a session)
 - Without a sandbox key, code runs in the default global namespace
 
+### Batching at Scale (big databases)
+
+Before writing a Python loop, check whether SQL already covers it:
+
+- **Batch decompile to files** — use `SELECT dump_pseudocode(path, addr_or_folder)` (see `functions` / `decompiler` skills). It writes one `.c` per function plus a manifest and never pulls pseudocode through the response. IDAPython is only needed for *custom* per-function passes beyond plain decompilation.
+- **Whole-program structural analytics** — materialize once with `idasql -s <db> --export-sqlite out.db` and query offline with plain sqlite3 (see `bigdb`), or opt into `PRAGMA idasql.xrefs_shared_cache = 1` for in-session xref analytics.
+
+When IDAPython IS the right tool (custom correlation passes over a working set):
+
+```sql
+PRAGMA idasql.enable_idapython = 1;
+PRAGMA idasql.idapython_output_max = 20000;  -- before big loops
+
+-- One snippet per pass, not one query per function. Globals persist per
+-- sandbox key, so keep processed-lists/caches in one sandbox per campaign and
+-- return only a summary; write findings to files or netnode_kv, never print
+-- raw bulk output.
+SELECT idapython_snippet('
+import ida_funcs, ida_hexrays, json
+processed = globals().get("processed", set())   # persists across calls
+targets = [0x123456, 0x1234A0]                  # bounded working set
+out = []
+for ea in targets:
+    if ea in processed: continue
+    processed.add(ea)
+    f = ida_funcs.get_func(ea)
+    if not f: continue
+    cf = ida_hexrays.decompile_func(f)
+    if cf is None:
+        out.append({"addr": hex(ea), "ok": False}); continue
+    # ...custom analysis of cf...
+    out.append({"addr": hex(ea), "ok": True})
+globals()["processed"] = processed
+print(json.dumps({"pass_done": len(out)}))
+', 'campaign');
+```
+
+- After a mutating snippet, the engine drops its funcs/names caches automatically
+  (any `idapython_*` call invalidates them), so subsequent SQL reads see fresh state.
+- Respect the same budgets as `bigdb`: bounded target sets, summary-only output.
+
 ### Error Propagation
 
 When a Python script raises an exception, it propagates as a SQL error:

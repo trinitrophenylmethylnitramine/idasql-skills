@@ -53,8 +53,10 @@ Session rules:
   live server deterministically; it is removed on clean shutdown (a stale file
   means an unclean exit — verify against `/status` before trusting it).
 - **`GET /status` (>= 0.0.19)** reports `db_path`, `funcs_count`/`names_count`/
-  `strings_count`/`segments_count` (instant, from `binary` metadata — not scans),
-  `tool_version`, `uptime_s`, `queries_served`, and `last_query_ms`.
+  `strings_count`/`segments_count` (a snapshot taken once at server startup —
+  structural counts, not live scans), `tool_version`, `uptime_s`,
+  `queries_served`, and `last_query_ms`. It never queues behind the executor:
+  it answers even while a long query is running.
 - **Fixed ports** make discovery deterministic: agree on a per-database port (or use
   `.pin` autostart from the IDA plugin) instead of random ones.
 - **Never `kill` mid-`save_database()`** — corrupts the IDB. Always `/shutdown`.
